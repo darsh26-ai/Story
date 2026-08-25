@@ -18,7 +18,7 @@ document.addEventListener("DOMContentLoaded", () => {
   renderCharacters();
   updateFavoriteCount();
   bindEvents();
-  populateVoices();
+  updateNarrationControls();
 });
 
 function bindEvents(){
@@ -31,11 +31,23 @@ function bindEvents(){
   $("prevBtn").onclick = () => advanceStory(false);
   $("replayBtn").onclick = replayStory;
   $("exitPlayerBtn").onclick = exitPlayer;
+
   $("volumeRange").oninput = e => StoryAudio.setVolume(e.target.value);
-  $("voiceSelect").onchange = e => StoryAudio.setVoice(e.target.value);
+
+  if ($("musicVolumeRange")) {
+    $("musicVolumeRange").oninput = e => StoryAudio.setMusicVolume(e.target.value);
+  }
+
+  if ($("effectsVolumeRange")) {
+    $("effectsVolumeRange").oninput = e => StoryAudio.setEffectsVolume(e.target.value);
+  }
+
   $("setupFavoriteBtn").onclick = () => toggleFavorite(selectedStory?.id);
   $("playerFavoriteBtn").onclick = () => toggleFavorite(session?.playlist[session.index]?.id);
-  $("bedtimeToggle").onchange = e => document.body.classList.toggle("bedtime", e.target.checked);
+
+  $("bedtimeToggle").onchange = e => {
+    document.body.classList.toggle("bedtime", e.target.checked);
+  };
 
   document.querySelectorAll("[data-view]").forEach(btn => {
     btn.addEventListener("click", () => showView(btn.dataset.view));
@@ -55,6 +67,20 @@ function bindEvents(){
       renderStories(btn.dataset.category);
     };
   });
+
+  StoryAudio.onLoadedMetadata = duration => {
+    if (!session) return;
+
+    const story = session.playlist[session.index];
+    if (!story) return;
+
+    story.actualDuration = duration;
+    updateCurrentStoryTiming();
+  };
+
+  StoryAudio.onTimeUpdate = () => {
+    updatePlayerProgress();
+  };
 }
 
 function showView(id){
@@ -116,6 +142,7 @@ function renderStories(category="all"){
       <div class="story-tags">
         <span class="tag">${story.category}</span>
         <span class="tag">~${story.duration} min</span>
+        ${story.narration ? '<span class="tag">🎙️ Your Voice</span>' : '<span class="tag">🗣️ Fallback</span>'}
       </div>
       <h3>${story.title}</h3>
       <p>${story.description}</p>
@@ -130,6 +157,7 @@ function renderStories(category="all"){
 function openStory(id){
   selectedStory = STORY_DATA.find(s => s.id === id);
   if(!selectedStory) return;
+
   $("setupStoryName").textContent = selectedStory.character + " • " + selectedStory.category;
   $("setupTitle").textContent = selectedStory.title;
   $("setupDescription").textContent = selectedStory.description;
@@ -151,6 +179,7 @@ function useCustomDuration(){
     alert("Please enter a duration between 1 and 180 minutes.");
     return;
   }
+
   selectedDuration = value;
   document.querySelectorAll(".duration-grid button").forEach(btn => btn.classList.remove("selected"));
   $("customMinutes").value = "";
@@ -160,35 +189,43 @@ function useCustomDuration(){
 function buildPlaylist(minutes){
   const pool = STORY_DATA.filter(s => s.region === selectedRegion);
   if(!pool.length) return [];
+
   const target = minutes * 60;
   const playlist = [];
   let total = 0;
   let index = pool.findIndex(s => s.id === selectedStory?.id);
+
   if(index < 0) index = 0;
 
-  for(let i=0; total < target; i++){
+  for(let i = 0; total < target; i++){
     const story = pool[(index + i) % pool.length];
     playlist.push(story);
-    total += story.duration * 60;
+    total += Number(story.duration || 1) * 60;
     if(i > 100) break;
   }
+
   return playlist;
 }
 
 function startStorySession(){
   if(!selectedStory) return;
+
   autoplay = $("autoplayToggle").checked;
+
   const bedtime = $("bedtimeToggle").checked;
+
   session = {
     duration: selectedDuration * 60,
     playlist: buildPlaylist(selectedDuration),
     index: 0
   };
+
   sessionElapsed = 0;
   isPaused = false;
+
   document.body.classList.toggle("bedtime", bedtime);
   addRecent(selectedStory.id);
-  populateVoices();
+
   showView("playerView");
   loadCurrentStory();
   startProgressTimer();
@@ -196,19 +233,31 @@ function startStorySession(){
 
 function loadCurrentStory(){
   if(!session || !session.playlist.length) return;
+
+  StoryAudio.stop();
+
   const story = session.playlist[session.index];
+
   $("playerArtwork").textContent = story.icon;
   $("playerCategory").textContent = `${story.character} • ${story.category.toUpperCase()}`;
   $("playerTitle").textContent = story.title;
   $("playerText").textContent = story.text;
-  $("playBtn").textContent = "⏸️";
-  $("playerModeLabel").textContent = document.body.classList.contains("bedtime") ? "🌙 Bedtime Story" : "🎧 Storytime";
+  $("playBtn").textContent = "▶️";
+  $("playerModeLabel").textContent =
+    document.body.classList.contains("bedtime")
+      ? "🌙 Bedtime Story"
+      : "🎧 Storytime";
+
   updatePlayerFavorite();
   renderPlaylist();
+  updateNarrationControls();
 
   StoryAudio.onEnd = () => {
     if(!session) return;
-    sessionElapsed += story.duration * 60;
+
+    const actualDuration = StoryAudio.getDuration() || Number(story.duration || 1) * 60;
+    sessionElapsed += actualDuration;
+
     if(sessionElapsed >= session.duration){
       finishSession();
     } else if(autoplay){
@@ -217,48 +266,69 @@ function loadCurrentStory(){
       $("playBtn").textContent = "▶️";
     }
   };
-  StoryAudio.speak(story.text);
+
+  // Start your recorded narration automatically.
+  StoryAudio.speak(story);
+  $("playBtn").textContent = "⏸️";
+  storyStartTime = Date.now();
 }
 
 function togglePlayback(){
   if(!session) return;
-  if("speechSynthesis" in window && speechSynthesis.paused){
-    StoryAudio.resume();
-    $("playBtn").textContent = "⏸️";
-    return;
-  }
+
   if(StoryAudio.isSpeaking){
     StoryAudio.pause();
+    isPaused = true;
     $("playBtn").textContent = "▶️";
     return;
   }
-  StoryAudio.speak(session.playlist[session.index].text);
+
+  StoryAudio.resume();
+
+  if(!StoryAudio.isSpeaking){
+    StoryAudio.speak(session.playlist[session.index]);
+  }
+
+  isPaused = false;
   $("playBtn").textContent = "⏸️";
 }
 
 function replayStory(){
   if(!session) return;
-  StoryAudio.speak(session.playlist[session.index].text);
+
+  const story = session.playlist[session.index];
+
+  StoryAudio.speak(story);
+  storyStartTime = Date.now();
+  isPaused = false;
   $("playBtn").textContent = "⏸️";
 }
 
 function advanceStory(forward){
   if(!session) return;
-  StoryAudio.stop();
-  if(forward){
+
+  const oldStory = session.playlist[session.index];
+  const actualDuration = StoryAudio.getCurrentTime() || Number(oldStory?.duration || 1) * 60;
+
+  if(forward) {
+    sessionElapsed += Math.min(actualDuration, Number(oldStory?.duration || actualDuration));
     session.index = (session.index + 1) % session.playlist.length;
-  }else{
+  } else {
     session.index = (session.index - 1 + session.playlist.length) % session.playlist.length;
   }
+
   loadCurrentStory();
 }
 
 function finishSession(){
   StoryAudio.stop();
   stopProgressTimer();
+
   $("playBtn").textContent = "▶️";
-  $("playerText").textContent = "✨ Storytime complete! Wonderful listening. Would you like another adventure?";
+  $("playerText").textContent =
+    "✨ Storytime complete! Wonderful listening. Would you like another adventure?";
   $("playerTitle").textContent = "The End ✨";
+
   session = null;
   renderPlaylist();
 }
@@ -272,18 +342,47 @@ function exitPlayer(){
 
 function startProgressTimer(){
   stopProgressTimer();
+
   storyStartTime = Date.now();
+
   progressTimer = setInterval(() => {
-    if(!session) return;
-    const current = sessionElapsed + Math.min(
-      (Date.now() - storyStartTime) / 1000,
-      session.playlist[session.index].duration * 60
-    );
-    const percent = Math.min(100, current / session.duration * 100);
-    $("sessionProgress").style.width = percent + "%";
-    $("storyProgressText").textContent = Math.round(percent) + "%";
-    $("sessionTimeLabel").textContent = formatTime(current) + " / " + formatTime(session.duration);
+    updatePlayerProgress();
   }, 250);
+}
+
+function updatePlayerProgress(){
+  if(!session) return;
+
+  const story = session.playlist[session.index];
+
+  let storyCurrent = StoryAudio.getCurrentTime();
+
+  if(!storyCurrent && StoryAudio.isSpeaking) {
+    storyCurrent = Math.min(
+      (Date.now() - storyStartTime) / 1000,
+      Number(story.duration || 1) * 60
+    );
+  }
+
+  const current = Math.min(
+    session.duration,
+    sessionElapsed + storyCurrent
+  );
+
+  const percent = Math.min(100, current / session.duration * 100);
+
+  $("sessionProgress").style.width = percent + "%";
+  $("storyProgressText").textContent = Math.round(percent) + "%";
+  $("sessionTimeLabel").textContent =
+    formatTime(current) + " / " + formatTime(session.duration);
+}
+
+function updateCurrentStoryTiming(){
+  const duration = StoryAudio.getDuration();
+
+  if(duration > 0 && session?.playlist?.[session.index]) {
+    session.playlist[session.index].actualDuration = duration;
+  }
 }
 
 function stopProgressTimer(){
@@ -296,12 +395,31 @@ function renderPlaylist(){
     $("playlist").innerHTML = "";
     return;
   }
+
   $("playlist").innerHTML = session.playlist.map((s,i) => `
     <div class="playlist-item ${i === session.index ? "current" : ""}">
       <span class="playlist-num">${i+1}</span>
       <span>${s.icon} ${s.title}</span>
     </div>
   `).join("");
+}
+
+function updateNarrationControls(){
+  const voiceSelect = $("voiceSelect");
+
+  if(voiceSelect){
+    voiceSelect.innerHTML = `<option value="recorded">🎙️ Your Recorded Voice</option>`;
+    voiceSelect.disabled = true;
+  }
+
+  const story = session?.playlist?.[session.index] || selectedStory;
+
+  const status = $("voiceStatus");
+  if(status){
+    status.textContent = story?.narration
+      ? "✓ Recorded narration"
+      : "⚠ Browser voice fallback";
+  }
 }
 
 function formatTime(seconds){
@@ -313,14 +431,21 @@ function formatTime(seconds){
 
 function toggleFavorite(id){
   if(!id) return;
+
   favorites = favorites.includes(id)
     ? favorites.filter(x => x !== id)
     : [...favorites,id];
+
   localStorage.setItem("storyFavorites", JSON.stringify(favorites));
+
   updateFavoriteCount();
   updateSetupFavorite();
   updatePlayerFavorite();
-  if(currentView === "libraryView") renderStories(document.querySelector(".filter-btn.active")?.dataset.category || "all");
+
+  if(currentView === "libraryView"){
+    renderStories(document.querySelector(".filter-btn.active")?.dataset.category || "all");
+  }
+
   if(currentView === "favoritesView") renderFavorites();
 }
 
@@ -330,24 +455,39 @@ function updateFavoriteCount(){
 
 function updateSetupFavorite(){
   if(!selectedStory) return;
-  $("setupFavoriteBtn").textContent = favorites.includes(selectedStory.id) ? "★ Saved to Favorites" : "☆ Add to Favorites";
+
+  $("setupFavoriteBtn").textContent =
+    favorites.includes(selectedStory.id)
+      ? "★ Saved to Favorites"
+      : "☆ Add to Favorites";
 }
 
 function updatePlayerFavorite(){
   const id = session?.playlist?.[session.index]?.id;
-  $("playerFavoriteBtn").textContent = favorites.includes(id) ? "★ Favorite Saved" : "☆ Favorite";
+
+  $("playerFavoriteBtn").textContent =
+    favorites.includes(id)
+      ? "★ Favorite Saved"
+      : "☆ Favorite";
 }
 
 function renderFavorites(){
   const list = STORY_DATA.filter(s => favorites.includes(s.id));
+
   if(!list.length){
-    $("favoritesGrid").innerHTML = `<div class="empty">No favorites yet. Save a story and it will appear here. ⭐</div>`;
+    $("favoritesGrid").innerHTML =
+      `<div class="empty">No favorites yet. Save a story and it will appear here. ⭐</div>`;
     return;
   }
+
   $("favoritesGrid").innerHTML = list.map(story => `
     <article class="story-card">
       <div class="story-art">${story.icon}</div>
-      <div class="story-tags"><span class="tag">${story.category}</span><span class="tag">~${story.duration} min</span></div>
+      <div class="story-tags">
+        <span class="tag">${story.category}</span>
+        <span class="tag">~${story.duration} min</span>
+        ${story.narration ? '<span class="tag">🎙️ Your Voice</span>' : '<span class="tag">🗣️ Fallback</span>'}
+      </div>
       <h3>${story.title}</h3>
       <p>${story.description}</p>
       <div class="story-buttons">
@@ -361,25 +501,4 @@ function renderFavorites(){
 function addRecent(id){
   recent = [id, ...recent.filter(x => x !== id)].slice(0,10);
   localStorage.setItem("storyRecent", JSON.stringify(recent));
-}
-
-function populateVoices(){
-  setTimeout(() => {
-    const select = $("voiceSelect");
-    if(!select) return;
-    const voices = StoryAudio.getVoices();
-    select.innerHTML = voices.length
-      ? voices.map(v => `<option value="${escapeHtml(v.name)}">${escapeHtml(v.name)} (${v.lang})</option>`).join("")
-      : `<option>Browser default voice</option>`;
-    if(voices.length){
-      StoryAudio.setVoice(voices[0].name);
-      select.value = voices[0].name;
-    }
-  }, 150);
-}
-
-function escapeHtml(value){
-  return String(value).replace(/[&<>"']/g, ch => ({
-    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"
-  }[ch]));
 }
